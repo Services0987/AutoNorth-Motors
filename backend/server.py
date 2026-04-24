@@ -639,15 +639,15 @@ async def on_startup():
     global db
     db = await get_db(DB_NAME)
     # Ensure at least one admin exists
-    if not await db.users.find_one({"email": "admin@autonorth.ca"}):
+    if not await db.users.find_one({"email": "autonorthab@gmail.com"}):
         admin_pwd = os.environ.get("ADMIN_PASSWORD", "AutoNorth2026!")
         await db.users.insert_one({
-            "email": "admin@autonorth.ca",
+            "email": "autonorthab@gmail.com",
             "password_hash": hash_password(admin_pwd),
             "role": "admin",
             "created_at": datetime.now(timezone.utc),
         })
-        logger.info("Seeded default admin user (admin@autonorth.ca).")
+        logger.info("Seeded default admin user (autonorthab@gmail.com).")
     # Seed inventory if empty
     if await db.vehicles.count_documents({}) == 0:
         try:

@@ -5,7 +5,7 @@ import os
 
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL', '').rstrip('/')
 
-ADMIN_EMAIL = "admin@autonorth.ca"
+ADMIN_EMAIL = "autonorthab@gmail.com"
 ADMIN_PASSWORD = "AdminPass2024"
 
 @pytest.fixture(scope="module")

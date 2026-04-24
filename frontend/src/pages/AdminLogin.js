@@ -64,7 +64,7 @@ export default function AdminLogin() {
               <input
                 type="email"
                 className="input-dark w-full px-4 py-3 text-sm font-body"
-                placeholder="admin@autonorth.ca"
+                placeholder="autonorthab@gmail.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
