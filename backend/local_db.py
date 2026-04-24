@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 
 from bson import ObjectId
 from mongomock_motor import AsyncMongoMockClient
+from motor.motor_asyncio import AsyncIOMotorClient
 
 
 DATA_DIR = pathlib.Path(os.environ.get("LOCAL_DB_DIR", "backend/.data"))
@@ -44,7 +45,16 @@ class PersistentDatabase:
     """Wraps an AsyncMongoMockClient database and persists writes to disk."""
 
     def __init__(self, db_name: str = "AutoNorth"):
-        self._client = AsyncMongoMockClient()
+        uri = os.environ.get("MONGODB_URI")
+        if uri:
+            print(f"[local_db] Connecting to real MongoDB...")
+            self._client = AsyncIOMotorClient(uri)
+            self._is_mock = False
+        else:
+            print(f"[local_db] Using in-memory mock MongoDB (data will be lost on Vercel restart)...")
+            self._client = AsyncMongoMockClient()
+            self._is_mock = True
+
         self._db = self._client[db_name]
         self._db_name = db_name
         self._lock = asyncio.Lock()
@@ -52,7 +62,7 @@ class PersistentDatabase:
         self._dirty = False
 
     async def load_from_disk(self) -> None:
-        if not DATA_FILE.exists():
+        if not self._is_mock or not DATA_FILE.exists():
             return
         try:
             raw = DATA_FILE.read_text(encoding="utf-8")
@@ -78,7 +88,9 @@ class PersistentDatabase:
         tmp.replace(DATA_FILE)
 
     def schedule_save(self) -> None:
-        """Coalesce many writes into a single disk flush."""
+        """Coalesce many writes into a single disk flush (only for mock)."""
+        if not self._is_mock:
+            return
         self._dirty = True
         if self._save_task and not self._save_task.done():
             return
