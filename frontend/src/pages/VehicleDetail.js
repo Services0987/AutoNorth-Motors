@@ -28,12 +28,19 @@ export default function VehicleDetail() {
   const [galleryHovered, setGalleryHovered] = useState(false);
   const galleryRef = useRef(null);
 
+  const [notFound, setNotFound] = useState(false);
+
   useEffect(() => {
+    setLoading(true);
+    setNotFound(false);
     axios.get(`${API}/vehicles/${id}`)
       .then(({ data }) => setVehicle(data))
-      .catch(() => navigate('/inventory'))
+      .catch((err) => {
+        console.error('Failed to load vehicle', err);
+        setNotFound(true);
+      })
       .finally(() => setLoading(false));
-  }, [id, navigate]);
+  }, [id]);
 
   const images = vehicle?.images?.length > 0 ? vehicle.images : [PLACEHOLDER];
 
@@ -52,7 +59,9 @@ export default function VehicleDetail() {
     try {
       await axios.post(`${API}/leads`, {
         lead_type: activeTab, name: form.name, email: form.email, phone: form.phone,
-        message: form.message, vehicle_id: vehicle?.id, vehicle_title: vehicle?.title,
+        message: form.message || `Enquiry on ${vehicle?.title || 'vehicle'}`,
+        vehicle_id: vehicle?._id || vehicle?.id,
+        vehicle_title: vehicle?.title,
         preferred_date: form.preferred_date || undefined, preferred_time: form.preferred_time || undefined,
         down_payment: form.down_payment ? parseFloat(form.down_payment) : undefined,
       });
@@ -66,7 +75,21 @@ export default function VehicleDetail() {
       <div className="w-10 h-10 border-2 border-[#D4AF37] border-t-transparent rounded-full animate-spin" />
     </div>
   );
-  if (!vehicle) return null;
+  if (notFound || !vehicle) return (
+    <div className="bg-[#050505] min-h-screen">
+      <Navbar />
+      <div className="pt-32 max-w-2xl mx-auto px-6 text-center">
+        <p className="text-[#D4AF37] text-xs tracking-[0.3em] uppercase font-heading mb-4">404 · Vehicle Not Found</p>
+        <h1 className="font-heading text-3xl md:text-4xl text-white mb-4">This vehicle is no longer available</h1>
+        <p className="text-white/50 font-body mb-8">It may have been sold or its listing has been updated. Browse the rest of our premium inventory.</p>
+        <div className="flex gap-3 justify-center">
+          <button onClick={() => navigate('/inventory')} className="btn-gold px-6 py-3 text-xs">View Inventory</button>
+          <a href="tel:+18256055050" className="btn-outline px-6 py-3 text-xs">Call 825-605-5050</a>
+        </div>
+      </div>
+      <Footer />
+    </div>
+  );
 
   const specs = [
     ['Year', vehicle.year], ['Make', vehicle.make], ['Model', vehicle.model],

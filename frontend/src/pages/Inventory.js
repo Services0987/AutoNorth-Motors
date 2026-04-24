@@ -157,12 +157,15 @@ function FilterSelect({ label, value, options, onChange, testId }) {
 /* ─── Bazaar Card ─── */
 function BazaarCard({ vehicle, index }) {
   const { ref, rotateX, rotateY, handleMouse, handleLeave } = use3DTilt(8);
+  const [hovered, setHovered] = useState(false);
   return (
     <motion.div
       ref={ref}
       style={{ rotateX, rotateY, transformStyle: 'preserve-3d', perspective: '800px' }}
       onMouseMove={handleMouse}
-      onMouseLeave={handleLeave}
+      onMouseLeave={() => { handleLeave(); setHovered(false); }}
+      onMouseEnter={() => setHovered(true)}
+      data-testid={`vehicle-card-${vehicle._id || vehicle.id}`}
       initial={{ opacity: 0, y: 40 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.6, delay: Math.min(index * 0.06, 0.5), ease: [0.16, 1, 0.3, 1] }}
@@ -206,7 +209,7 @@ export default function Inventory() {
   const [loading, setLoading]   = useState(true);
   const [showFilters, setShowFilters] = useState(false);
   const [page, setPage] = useState(1);
-  const limit = 8;
+  const limit = 20;
 
   const [filters, setFilters] = useState({
     search:    '',
@@ -235,9 +238,19 @@ export default function Inventory() {
       const { data } = await axios.get(`${API}/vehicles?${params}`);
       setVehicles(data.vehicles || []);
       setTotal(data.total || 0);
-      window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) { console.error(err); } finally { setLoading(false); }
   }, [filters, page]);
+
+  const gridRef = useRef(null);
+  const onPageChange = (p) => {
+    if (p < 1 || (totalPages && p > totalPages)) return;
+    setPage(p);
+    setTimeout(() => {
+      if (gridRef.current) {
+        gridRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 50);
+  };
 
   useEffect(() => { fetchVehicles(); }, [fetchVehicles]);
 
@@ -457,7 +470,7 @@ export default function Inventory() {
         </div>
 
         {/* VEHICLE GRID */}
-        <div className="max-w-7xl mx-auto px-6 md:px-12 py-12 relative z-20">
+        <div ref={gridRef} className="max-w-7xl mx-auto px-6 md:px-12 py-12 relative z-20">
           <AnimatePresence mode="wait">
             {loading ? (
               <motion.div key="loading" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
@@ -489,7 +502,7 @@ export default function Inventory() {
 
           {!loading && totalPages > 1 && (
             <div className="mt-16 flex flex-col items-center">
-              <Pagination page={page} totalPages={totalPages} onPage={(p) => setPage(p)} />
+              <Pagination page={page} totalPages={totalPages} onPage={onPageChange} />
             </div>
           )}
 

@@ -295,7 +295,7 @@ export default function Home() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-8" style={{ perspective: '900px' }}>
               {featured.slice(0, 3).map((v, i) => (
                 <motion.div
-                  key={v.id}
+                  key={v._id || v.id || i}
                   initial={{ opacity: 0, z: -200, y: 60 }}
                   whileInView={{ opacity: 1, z: 0, y: 0 }}
                   viewport={{ once: true }}

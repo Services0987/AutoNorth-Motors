@@ -22,6 +22,7 @@ const EMPTY_FORM = {
   transmission: 'Automatic', exterior_color: '', interior_color: '', engine: '',
   drivetrain: 'FWD', doors: 4, seats: 5, vin: '', stock_number: '',
   description: '', features: [], images: [], status: 'available', featured: false,
+  show_on_home: false,
 };
 
 const STATUS_COLOR = { 
@@ -53,6 +54,9 @@ export default function AdminInventory() {
   const [saving, setSaving] = useState(false);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const limit = 20;
   const [newFeature, setNewFeature] = useState('');
   const [newImage, setNewImage] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState(null);
@@ -69,10 +73,12 @@ export default function AdminInventory() {
   const fetchVehicles = useCallback(async () => {
     setLoading(true);
     try {
-      const { data } = await axios.get(`${API}/vehicles?status=all&limit=200`, { withCredentials: true });
+      const skip = (page - 1) * limit;
+      const { data } = await axios.get(`${API}/vehicles?status=all&limit=${limit}&skip=${skip}&search=${search}`, { withCredentials: true });
       setVehicles(data.vehicles || []);
+      setTotal(data.total || 0);
     } catch (err) { console.error(err); } finally { setLoading(false); }
-  }, []);
+  }, [page, search]);
 
   const fetchScraperSettings = useCallback(async () => {
     try {
@@ -105,7 +111,7 @@ export default function AdminInventory() {
     e.preventDefault(); setSaving(true);
     try {
       const payload = { ...form, year: parseInt(form.year), price: parseFloat(form.price), mileage: parseInt(form.mileage || 0) };
-      if (editing) await axios.put(`${API}/vehicles/${editing.id}`, payload, { withCredentials: true });
+      if (editing) await axios.put(`${API}/vehicles/${editing._id || editing.id}`, payload, { withCredentials: true });
       else await axios.post(`${API}/vehicles`, payload, { withCredentials: true });
       closeModal(); fetchVehicles();
     } catch (err) { console.error(err); } finally { setSaving(false); }
@@ -119,9 +125,34 @@ export default function AdminInventory() {
   const handleBulkDelete = async () => {
     if (!window.confirm(`Are you sure you want to delete ${selectedIds.length} vehicles?`)) return;
     try {
-      await axios.delete(`${API}/vehicles/bulk/delete`, { data: selectedIds, withCredentials: true });
+      await axios.delete(`${API}/vehicles/bulk/delete`, { data: { vehicle_ids: selectedIds }, withCredentials: true });
       setSelectedIds([]); fetchVehicles();
-    } catch (err) { console.error(err); }
+    } catch (err) { console.error(err); alert('Bulk delete failed'); }
+  };
+
+  const toggleVehicleFlag = async (id, field, value) => {
+    try {
+      await axios.patch(`${API}/vehicles/${id}/toggle`, { [field]: value }, { withCredentials: true });
+      setVehicles(prev => prev.map(v => ((v._id || v.id) === id ? { ...v, [field]: value } : v)));
+    } catch (err) { console.error(err); alert('Update failed'); }
+  };
+
+  // Bulk image URL paste — used inside the edit modal
+  const [bulkImagesText, setBulkImagesText] = useState('');
+  const handleBulkImagePaste = () => {
+    const urls = bulkImagesText.split(/[\s,;\n]+/).map(s => s.trim()).filter(s => s.startsWith('http'));
+    if (!urls.length) return;
+    setF('images', [...form.images, ...urls]);
+    setBulkImagesText('');
+  };
+  const handleBulkImageReplace = async () => {
+    if (!editing) return;
+    const id = editing._id || editing.id;
+    try {
+      const { data } = await axios.post(`${API}/vehicles/${id}/images`, { urls: form.images }, { withCredentials: true });
+      setF('images', data.images);
+      alert(`Saved ${data.count} images.`);
+    } catch (err) { console.error(err); alert('Save failed'); }
   };
 
   const toggleAutoSync = async () => {
@@ -181,9 +212,10 @@ export default function AdminInventory() {
   };
 
   const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
-  const toggleSelectAll = () => setSelectedIds(selectedIds.length === filtered.length ? [] : filtered.map(v => v.id));
+  const toggleSelectAll = () => setSelectedIds(selectedIds.length === vehicles.length && vehicles.length > 0 ? [] : vehicles.map(v => v._id || v.id));
 
-  const filtered = vehicles.filter(v => (!search || v.title?.toLowerCase().includes(search.toLowerCase()) || v.make?.toLowerCase().includes(search.toLowerCase())) && (statusFilter === 'all' || v.status === statusFilter));
+  const filtered = vehicles;
+  const totalPages = Math.ceil(total / limit);
 
   if (loadingAuth) return <div className="min-h-screen bg-[#050505] flex items-center justify-center font-heading text-[#D4AF37] uppercase tracking-[0.3em] text-xs">Initializing Secure Portal...</div>;
   if (!user) return <div className="min-h-screen bg-[#050505] flex items-center justify-center font-heading text-white/20 uppercase tracking-[0.3em] text-xs">Unauthorized · 403</div>;
@@ -250,7 +282,7 @@ export default function AdminInventory() {
                 {SAFE_ICON(Trash2, { size: 11 })} Delete {selectedIds.length} Selected
               </button>
             )}
-            <span className="text-white/25 text-xs font-body ml-2">{filtered.length} vehicles matching</span>
+            <span className="text-white/25 text-xs font-body ml-2">{total} vehicles total</span>
           </div>
           <div className="flex items-center gap-3">
             <input type="file" id="csv-upload" className="hidden" accept=".csv" onChange={handleCSVUpload} />
@@ -272,7 +304,7 @@ export default function AdminInventory() {
           <table className="w-full text-sm font-body">
             <thead>
               <tr className="border-b border-white/[0.05] bg-white/[0.01]">
-                <th className="px-4 py-4 text-left"><input type="checkbox" className="accent-[#D4AF37]" checked={selectedIds.length === filtered.length && filtered.length > 0} onChange={toggleSelectAll} /></th>
+                <th className="px-4 py-4 text-left"><input type="checkbox" className="accent-[#D4AF37]" checked={selectedIds.length === vehicles.length && vehicles.length > 0} onChange={toggleSelectAll} /></th>
                 {['Image', 'Vehicle Overview', 'Price', 'Class', 'Current Status', 'Featured', 'Actions'].map(h => (
                    <th key={h} className="text-left px-4 py-4 text-[10px] font-heading tracking-[0.18em] uppercase text-white/25">{h}</th>
                 ))}
@@ -284,19 +316,38 @@ export default function AdminInventory() {
                    <td className="px-4 py-4"><div className="h-4 w-4 bg-white/[0.03] animate-pulse" /></td>
                   {[...Array(7)].map((_, j) => <td key={j} className="px-4 py-4"><div className="h-4 bg-white/[0.03] animate-pulse" /></td>)}
                 </tr>
-              )) : filtered.map(v => (
-                <tr key={v.id} className={`border-b border-white/[0.03] transition-colors ${selectedIds.includes(v.id) ? 'bg-[#D4AF37]/5' : 'hover:bg-white/[0.01]'}`}>
-                  <td className="px-4 py-3"><input type="checkbox" className="accent-[#D4AF37]" checked={selectedIds.includes(v.id)} onChange={() => toggleSelect(v.id)} /></td>
+              )) : vehicles.map(v => (
+                <tr key={v._id || v.id} className={`border-b border-white/[0.03] transition-colors ${selectedIds.includes(v._id || v.id) ? 'bg-[#D4AF37]/5' : 'hover:bg-white/[0.01]'}`}>
+                  <td className="px-4 py-3"><input type="checkbox" className="accent-[#D4AF37]" checked={selectedIds.includes(v._id || v.id)} onChange={() => toggleSelect(v._id || v.id)} /></td>
                   <td className="px-4 py-3"><img src={v.images?.[0] || PLACEHOLDER} alt="" className="w-16 h-11 object-cover border border-white/5" /></td>
                   <td className="px-4 py-3"><p className="text-white text-xs font-medium">{v.title}</p><p className="text-white/25 text-[10px] mt-1 uppercase font-body">{v.year}</p></td>
                   <td className="px-4 py-3 text-[#D4AF37] font-heading text-sm font-semibold">${v.price?.toLocaleString()}</td>
                   <td className="px-4 py-3"><span className={`px-2.5 py-1 text-[10px] font-heading uppercase ${v.condition === 'new' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-[#D4AF37]/10 text-[#D4AF37]'}`}>{v.condition}</span></td>
                   <td className="px-4 py-3"><div className={`text-[10px] px-2 py-1 inline-block border uppercase ${v.status === 'available' ? 'border-emerald-500/20 text-emerald-400' : 'border-red-500/20 text-red-400'}`}>{v.status}</div></td>
-                  <td className="px-4 py-3">{SAFE_ICON(Star, { size: 16, className: v.featured ? 'text-[#D4AF37]' : 'text-white/10' })}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex gap-3 items-center">
+                      <button
+                        type="button"
+                        title={v.featured ? 'Featured (click to unfeature)' : 'Mark as Featured'}
+                        onClick={() => toggleVehicleFlag(v._id || v.id, 'featured', !v.featured)}
+                        className="hover:scale-110 transition-transform"
+                      >
+                        {SAFE_ICON(Star, { size: 16, className: v.featured ? 'text-[#D4AF37] fill-[#D4AF37]' : 'text-white/15 hover:text-white/40' })}
+                      </button>
+                      <button
+                        type="button"
+                        title={v.show_on_home ? 'Showing on home (click to hide)' : 'Show on home'}
+                        onClick={() => toggleVehicleFlag(v._id || v.id, 'show_on_home', !v.show_on_home)}
+                        className="hover:scale-110 transition-transform"
+                      >
+                        {SAFE_ICON(Globe, { size: 16, className: v.show_on_home ? 'text-emerald-400' : 'text-white/15 hover:text-white/40' })}
+                      </button>
+                    </div>
+                  </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-4">
                       <button onClick={() => openEdit(v)} className="text-white/20 hover:text-white transition-colors">{SAFE_ICON(Pencil, { size: 15 })}</button>
-                      <button onClick={() => setDeleteConfirm(v.id)} className="text-white/20 hover:text-red-500 transition-colors">{SAFE_ICON(Trash2, { size: 15 })}</button>
+                      <button onClick={() => setDeleteConfirm(v._id || v.id)} className="text-white/20 hover:text-red-500 transition-colors">{SAFE_ICON(Trash2, { size: 15 })}</button>
                     </div>
                   </td>
                 </tr>
@@ -304,6 +355,15 @@ export default function AdminInventory() {
             </tbody>
           </table>
         </div>
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div className="flex justify-center items-center gap-2 mt-6">
+            <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1} className="p-2 border border-white/10 text-white/40 hover:text-white disabled:opacity-30"><ChevronLeft size={16} /></button>
+            <span className="text-white/40 text-xs font-heading">Page {page} of {totalPages}</span>
+            <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages} className="p-2 border border-white/10 text-white/40 hover:text-white disabled:opacity-30"><ChevronRight size={16} /></button>
+          </div>
+        )}
       </div>
 
       {deleteConfirm && (
@@ -347,13 +407,36 @@ export default function AdminInventory() {
                         <p className="text-[10px] tracking-[0.3em] uppercase text-[#D4AF37] font-heading mb-4">{SAFE_ICON(LayoutGrid, { size: 12 })} Visual Assets</p>
                         <div className="space-y-4">
                           <div className="flex gap-2">
-                            <input className="input-dark flex-1 px-4 py-3 text-sm font-body" placeholder="Import link..." value={newImage} onChange={e => setNewImage(e.target.value)} />
-                            <button type="button" onClick={addImage} className="btn-gold px-6 py-3 text-xs uppercase">Upload</button>
+                            <input className="input-dark flex-1 px-4 py-3 text-sm font-body" placeholder="Single image URL..." value={newImage} onChange={e => setNewImage(e.target.value)} />
+                            <button type="button" onClick={addImage} className="btn-gold px-6 py-3 text-xs uppercase">Add</button>
+                          </div>
+                          <div>
+                            <label className="text-[10px] tracking-[0.2em] uppercase text-white/40 font-heading block mb-2">
+                              Bulk Image URL Paste — one per line, or comma/space separated
+                            </label>
+                            <textarea
+                              className="input-dark w-full px-4 py-3 text-xs font-body resize-y"
+                              rows={4}
+                              placeholder={"https://...\nhttps://...\nhttps://..."}
+                              value={bulkImagesText}
+                              onChange={e => setBulkImagesText(e.target.value)}
+                            />
+                            <div className="flex gap-2 mt-2">
+                              <button type="button" onClick={handleBulkImagePaste} className="btn-outline px-4 py-2 text-[10px] uppercase tracking-widest">
+                                Append All ({bulkImagesText.split(/[\s,;\n]+/).filter(s => s.trim().startsWith('http')).length})
+                              </button>
+                              {editing && (
+                                <button type="button" onClick={handleBulkImageReplace} className="px-4 py-2 text-[10px] uppercase tracking-widest border border-[#D4AF37]/40 text-[#D4AF37] hover:bg-[#D4AF37]/10">
+                                  Save Images Now
+                                </button>
+                              )}
+                            </div>
                           </div>
                           <div className="grid grid-cols-4 gap-3">
                             {form.images.map((img, i) => (
                               <div key={i} className="relative aspect-[4/3] border border-white/5 group">
-                                <img src={img} alt="" className="w-full h-full object-cover" />
+                                <img src={img} alt="" className="w-full h-full object-cover" onError={(e) => { e.target.style.opacity = '0.3'; }} />
+                                <div className="absolute top-1 left-1 bg-black/70 text-[#D4AF37] text-[9px] px-1.5 py-0.5 font-heading">{i + 1}</div>
                                 <div className="absolute inset-0 bg-black/80 opacity-0 group-hover:opacity-100 flex items-center justify-center gap-2">
                                   <button type="button" onClick={() => moveImage(i, -1)}>{SAFE_ICON(ChevronLeft, { size: 12 })}</button>
                                   <button type="button" onClick={() => removeImage(i)}>{SAFE_ICON(Trash2, { size: 12 })}</button>
@@ -399,6 +482,16 @@ export default function AdminInventory() {
                       <div className="grid grid-cols-2 gap-4">
                         <Field label="Exterior Color"><Input value={form.exterior_color} onChange={e => setF('exterior_color', e.target.value)} /></Field>
                         <Field label="Interior Color"><Input value={form.interior_color} onChange={e => setF('interior_color', e.target.value)} /></Field>
+                      </div>
+                      <div className="grid grid-cols-2 gap-4 bg-white/[0.02] p-4 border border-white/[0.05]">
+                        <div className="flex items-center gap-3">
+                          <input type="checkbox" id="f-home" checked={form.show_on_home} onChange={e => setF('show_on_home', e.target.checked)} className="accent-[#D4AF37]" />
+                          <label htmlFor="f-home" className="text-[10px] font-heading uppercase tracking-widest text-white/50 cursor-pointer">Show on Home</label>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <input type="checkbox" id="f-feat" checked={form.featured} onChange={e => setF('featured', e.target.checked)} className="accent-[#D4AF37]" />
+                          <label htmlFor="f-feat" className="text-[10px] font-heading uppercase tracking-widest text-white/50 cursor-pointer">Mark Featured</label>
+                        </div>
                       </div>
                       <Field label="Description"><textarea className="input-dark w-full px-3 py-2.5 text-sm font-body h-24" value={form.description} onChange={e => setF('description', e.target.value)} /></Field>
                       

@@ -61,19 +61,34 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  // Replit iframe proxy: allow all hosts (mTLS-protected at edge).
+  devServerConfig.allowedHosts = "all";
+  devServerConfig.host = "0.0.0.0";
+  devServerConfig.port = 5000;
+  devServerConfig.client = {
+    ...(devServerConfig.client || {}),
+    webSocketURL: { hostname: "0.0.0.0", port: 0, protocol: "ws" },
+    overlay: false,
+  };
+  // Disable cache headers in development so the iframe always sees fresh code.
+  if (process.env.NODE_ENV !== "production") {
+    devServerConfig.headers = {
+      ...(devServerConfig.headers || {}),
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      "Pragma": "no-cache",
+      "Expires": "0",
+    };
+  }
+
   // Add health check endpoints if enabled
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;
 
     devServerConfig.setupMiddlewares = (middlewares, devServer) => {
-      // Call original setup if exists
       if (originalSetupMiddlewares) {
         middlewares = originalSetupMiddlewares(middlewares, devServer);
       }
-
-      // Setup health endpoints
       setupHealthEndpoints(devServer, healthPluginInstance);
-
       return middlewares;
     };
   }
