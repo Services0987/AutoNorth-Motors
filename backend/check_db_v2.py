@@ -16,6 +16,13 @@ async def check():
         for s in sessions:
             print(f"  - {s.get('_id')} (Created: {s.get('created_at')})")
             
+        # Check vehicles
+        v_count = await db.vehicles.count_documents({})
+        print(f"Vehicles: {v_count}")
+        if v_count > 0:
+            sample = await db.vehicles.find_one({})
+            print(f"Sample Vehicle: {sample.get('title')}")
+            
         # Check settings
         general = await db.settings.find_one({'type': 'general'})
         print(f"General Settings: {general}")
