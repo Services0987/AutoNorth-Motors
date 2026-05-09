@@ -1,0 +1,819 @@
+﻿from dotenv import load_dotenv
+load_dotenv()
+try:
+    from google import genai
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
+    print("Warning: google-genai package not found. AI Specialist will be limited.")
+
+import os
+import re
+import io
+import jwt
+import bcrypt
+import logging
+import pathlib
+import httpx
+import logging
+import csv
+import io
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status, File, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from pydantic import BaseModel, Field, BeforeValidator, ConfigDict
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="AutoNorth Motors API")
+api_router = APIRouter(prefix="/api")
+
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL, "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Database Resilience Configuration ---
+# Priority: MONGODB_URI (Vercel standard) > MONGO_URL > Fallback
+def get_mongo_url():
+    url = os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URL')
+    if not url or url.strip() == "":
+        logger.error("CRITICAL: No MongoDB URI found in environment variables!")
+        # We return None so the Proxy can handle the 503 error gracefully
+        return None
+    return url.strip()
+
+mongo_url = get_mongo_url()
+db_name = os.environ.get('DB_NAME', "autonorth")
+
+# Lazy initialization to prevent module-level crashes
+_client = None
+_db = None
+
+def get_db():
+    global _client, _db
+    if _db is None:
+        url = get_mongo_url()
+        if not url: return None
+        try:
+            logger.info("Initializing MongoDB connection...")
+            _client = AsyncIOMotorClient(url, serverSelectionTimeoutMS=5000)
+            _db = _client[db_name]
+        except Exception as e:
+            logger.error(f"MongoDB Initialization Failed: {str(e)}")
+            return None
+    return _db
+
+class DatabaseProxy:
+    """Proxy object that initializes the DB on first access to prevent NoneType errors."""
+    def __getattr__(self, name):
+        db_obj = get_db()
+        if db_obj is None:
+            raise HTTPException(status_code=503, detail="Inventory database currently unavailable")
+        return getattr(db_obj, name)
+
+# This proxy replaces the static 'db' object so all existing 'db.collection' calls work automatically
+db = DatabaseProxy()
+
+# Global error handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_type = type(exc).__name__
+    error_msg = str(exc)
+    logger.error(f"Global error [{error_type}]: {error_msg}", exc_info=True)
+    
+    # Check if this is a DB-related crash
+    if "NoneType" in error_msg and "vehicles" in error_msg:
+        return JSONResponse(status_code=503, content={"error": "Database Unavailable", "message": "The system is currently unable to connect to the inventory database."})
+    
+    msg = error_msg if isinstance(exc, HTTPException) else f"Platform conflict: {error_type}"
+    return JSONResponse(status_code=500, content={"error": "Internal Server Error", "message": msg})
+
+# --- DB Middleware ---
+@app.middleware("http")
+async def db_session_middleware(request: Request, call_next):
+    get_db()
+    return await call_next(request)
+
+def safe_price(v):
+    try:
+        p = v.get('price', 0)
+        return float(p) if p else 0.0
+    except: return 0.0
+
+JWT_ALGORITHM = "HS256"
+chat_sessions: dict = {}
+
+# ΓöÇΓöÇΓöÇ Auth ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+def hash_password(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+def verify_password(plain, hashed): return bcrypt.checkpw(plain.encode(), hashed.encode())
+def jwt_secret(): return os.environ.get("JWT_SECRET", "super-secret-key")
+
+def create_token(user_id, email, kind="access", exp_hours=24):
+    exp = timedelta(hours=exp_hours) if kind == "access" else timedelta(days=7)
+    return jwt.encode({"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + exp, "type": kind}, jwt_secret(), algorithm=JWT_ALGORITHM)
+
+async def get_current_user(request: Request):
+    # IP Blacklist Check
+    ip = request.client.host if request.client else "unknown"
+    is_blocked = await db.blacklist.find_one({"ip": ip})
+    if is_blocked: raise HTTPException(403, "Access denied from this IP")
+
+    token = request.cookies.get("access_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "): token = auth[7:]
+    if not token: raise HTTPException(401, "Not authenticated")
+    try:
+        p = jwt.decode(token, jwt_secret(), algorithms=[JWT_ALGORITHM])
+        user = await db.users.find_one({"_id": ObjectId(p["sub"])})
+        if not user: raise HTTPException(401, "User not found")
+        
+        # Check if session is still valid
+        session = await db.sessions.find_one({"token": token, "is_active": True})
+        if not session: raise HTTPException(401, "Session expired or terminated")
+        
+        user["_id"] = str(user["_id"])
+        return user
+    except Exception as e:
+        logger.error(f"JWT Decryption Error: {e}")
+        raise HTTPException(401, "Invalid or expired token")
+
+# ΓöÇΓöÇΓöÇ Models ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+class VehicleCreate(BaseModel):
+    title: str; make: str; model: str; year: int; price: float; mileage: int
+    condition: str; body_type: str; fuel_type: Optional[str] = "Gas"
+    transmission: Optional[str] = "Automatic"; exterior_color: Optional[str] = ""
+    interior_color: Optional[str] = ""; engine: Optional[str] = ""
+    vin: Optional[str] = ""; stock_number: Optional[str] = ""
+    description: Optional[str] = ""; images: List[str] = []
+    status: Optional[str] = "available"; featured: Optional[bool] = False
+    show_on_home: Optional[bool] = False
+
+class VehicleUpdate(BaseModel):
+    title: Optional[str] = None; make: Optional[str] = None; model: Optional[str] = None
+    year: Optional[int] = None; price: Optional[float] = None; mileage: Optional[int] = None
+    condition: Optional[str] = None; body_type: Optional[str] = None
+    status: Optional[str] = None; featured: Optional[bool] = None; show_on_home: Optional[bool] = None
+    images: Optional[List[str]] = None
+
+class LeadCreate(BaseModel):
+    name: str; email: str; phone: str; lead_type: str; message: Optional[str] = ""
+    vehicle_id: Optional[str] = None; vehicle_name: Optional[str] = None
+
+class ChatRequest(BaseModel):
+    message: str; session_id: Optional[str] = None
+    vehicle_id: Optional[str] = None; url_context: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str; password: str
+
+class AnalyticsEvent(BaseModel):
+    event_type: str # 'view', 'click', 'lead_start', 'search'
+    vehicle_id: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+class IPBlockRequest(BaseModel):
+    ip: str; reason: Optional[str] = ""
+
+# ΓöÇΓöÇΓöÇ Endpoints ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+@api_router.post("/auth/login")
+async def login(request: Request, data: LoginRequest, response: Response):
+    email = data.email.lower().strip()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    
+    uid = str(user["_id"])
+    token = create_token(uid, email)
+    
+    # Track login session
+    ip = request.client.host if request.client else "unknown"
+    ua = request.headers.get("user-agent", "unknown")
+    await db.sessions.insert_one({
+        "user_id": uid, "token": token, "ip": ip, "user_agent": ua,
+        "is_active": True, "created_at": datetime.now(timezone.utc)
+    })
+    
+    response.set_cookie("access_token", token, httponly=True, secure=True, samesite="lax", max_age=86400, path="/")
+    return {"id": uid, "email": email, "role": "admin"}
+
+@api_router.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get("access_token")
+    if token:
+        await db.sessions.update_one({"token": token}, {"$set": {"is_active": False}})
+    response.delete_cookie("access_token")
+    return {"message": "Logged out"}
+
+@api_router.get("/auth/sessions")
+async def list_sessions(cu=Depends(get_current_user)):
+    docs = await db.sessions.find({"user_id": cu["_id"], "is_active": True}).sort("created_at", -1).to_list(100)
+    for d in docs: d["_id"] = str(d["_id"]); d.pop("token", None)
+    return docs
+
+@api_router.post("/auth/sessions/terminate")
+async def terminate_session(session_id: str, cu=Depends(get_current_user)):
+    await db.sessions.update_one({"_id": ObjectId(session_id), "user_id": cu["_id"]}, {"$set": {"is_active": False}})
+    return {"message": "Session terminated"}
+
+@api_router.get("/auth/me")
+async def me(cu=Depends(get_current_user)):
+    cu["_id"] = str(cu["_id"])
+    cu.pop("password_hash", None)
+    return cu
+
+@api_router.put("/auth/profile")
+async def update_profile(request: Request, cu=Depends(get_current_user)):
+    try:
+        data = await request.json()
+        upd = {}
+        if "email" in data: upd["email"] = data["email"].lower().strip()
+        if "password" in data and data["password"]:
+            upd["password_hash"] = hash_password(data["password"])
+        if not upd: return {"message": "No changes"}
+        await db.users.update_one({"_id": ObjectId(cu["_id"])}, {"$set": upd})
+        return {"message": "Profile updated successfully"}
+    except Exception as e:
+        logger.error(f"Profile Update Error: {e}")
+        raise HTTPException(500, "Failed to update profile")
+
+@api_router.get("/settings")
+async def get_settings(cu=Depends(get_current_user)):
+    s = await db.settings.find_one({"type": "general"}) or {}
+    if s: s.pop("_id", None)
+    return s
+
+@api_router.put("/settings")
+async def update_settings(request: Request, cu=Depends(get_current_user)):
+    data = await request.json()
+    await db.settings.update_one({"type": "general"}, {"$set": data}, upsert=True)
+    return {"message": "Settings updated"}
+
+@api_router.get("/analytics/summary")
+async def get_analytics_summary(cu=Depends(get_current_user)):
+    # Aggregation for top vehicles with names
+    top_views = await db.analytics.aggregate([
+        {"$match": {"event_type": "view"}},
+        {"$group": {"_id": "$vehicle_id", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10},
+        {"$addFields": {"oid": {"$cond": {
+            "if": {"$and": [{"$ne": ["$_id", None]}, {"$eq": [{"$strLenCP": "$_id"}, 24]}]},
+            "then": {"$toObjectId": "$_id"},
+            "else": None
+        }}}},
+        {"$lookup": {
+            "from": "vehicles",
+            "localField": "oid",
+            "foreignField": "_id",
+            "as": "vehicle"
+        }},
+        {"$unwind": {"path": "$vehicle", "preserveNullAndEmptyArrays": True}},
+        {"$project": {
+            "_id": 1, "count": 1,
+            "title": {"$ifNull": ["$vehicle.title", "Unknown Vehicle"]},
+            "vin": {"$ifNull": ["$vehicle.vin", "N/A"]}
+        }}
+    ]).to_list(10)
+    
+    # Lead conversion rate
+    total_views = await db.analytics.count_documents({"event_type": "view"})
+    total_leads = await db.leads.count_documents({})
+    
+    return {
+        "top_vehicles": top_views,
+        "total_views": total_views,
+        "conversion_rate": (total_leads / total_views * 100) if total_views > 0 else 0
+    }
+
+@api_router.get("/analytics/export")
+async def export_analytics(cu=Depends(get_current_user)):
+    events = await db.analytics.find({}).sort("created_at", -1).to_list(5000)
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["id", "event_type", "vehicle_id", "ip", "created_at", "metadata"])
+    writer.writeheader()
+    for e in events:
+        writer.writerow({
+            "id": str(e["_id"]),
+            "event_type": e.get("event_type"),
+            "vehicle_id": e.get("vehicle_id"),
+            "ip": e.get("ip"),
+            "created_at": e.get("created_at"),
+            "metadata": json.dumps(e.get("metadata", {}))
+        })
+    output.seek(0)
+    return Response(content=output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=autonorth_analytics.csv"})
+
+@api_router.post("/analytics/reset")
+async def reset_analytics(cu=Depends(get_current_user)):
+    await db.analytics.delete_many({})
+    return {"message": "Analytics cleared"}
+
+@api_router.post("/analytics/track")
+async def track_event(request: Request, event: AnalyticsEvent):
+    doc = {
+        **event.model_dump(),
+        "ip": request.client.host if request.client else "unknown",
+        "created_at": datetime.now(timezone.utc)
+    }
+    await db.analytics.insert_one(doc)
+    return {"status": "ok"}
+
+@api_router.get("/security/blacklist")
+async def get_blacklist(cu=Depends(get_current_user)):
+    docs = await db.blacklist.find({}).to_list(100)
+    for d in docs: d["_id"] = str(d["_id"])
+    return docs
+
+@api_router.post("/security/blacklist")
+async def block_ip(data: IPBlockRequest, cu=Depends(get_current_user)):
+    await db.blacklist.update_one({"ip": data.ip}, {"$set": {"reason": data.reason, "blocked_at": datetime.now(timezone.utc)}}, upsert=True)
+    return {"message": f"IP {data.ip} blocked"}
+
+@api_router.get("/stats")
+async def get_stats(cu=Depends(get_current_user)):
+    total = await db.vehicles.count_documents({})
+    avail = await db.vehicles.count_documents({"status": "available"})
+    sold = await db.vehicles.count_documents({"status": "sold"})
+    featured = await db.vehicles.count_documents({"featured": True})
+    t_leads = await db.leads.count_documents({}) if "leads" in (await db.list_collection_names()) else 0
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    recent_leads = await db.leads.count_documents({"created_at": {"$gte": thirty_days_ago}}) if "leads" in (await db.list_collection_names()) else 0
+    
+    # Analytics
+    total_clicks = await db.analytics.count_documents({"event_type": "click"})
+    total_views = await db.analytics.count_documents({"event_type": "view"})
+    
+    return {
+        "total_vehicles": total,
+        "available": avail,
+        "sold": sold,
+        "featured": featured,
+        "total_leads": t_leads,
+        "recent_leads": recent_leads,
+        "total_clicks": total_clicks,
+        "total_views": total_views
+    }
+
+@api_router.get("/vehicles")
+async def list_vehicles(
+    make: Optional[str] = None, body_type: Optional[str] = None,
+    condition: Optional[str] = None, fuel_type: Optional[str] = None,
+    min_price: Optional[float] = None, max_price: Optional[float] = None,
+    status: Optional[str] = "available", featured: Optional[bool] = None,
+    show_on_home: Optional[bool] = None, search: Optional[str] = None, 
+    limit: int = 50, skip: int = 0
+):
+    try:
+        q = {}
+        if show_on_home is not None: q["show_on_home"] = show_on_home
+        if make: q["make"] = {"$regex": make, "$options": "i"}
+        if body_type: q["body_type"] = body_type
+        if condition: q["condition"] = condition
+        if fuel_type: q["fuel_type"] = fuel_type
+        if status and status != "all": q["status"] = status
+        if featured is not None: q["featured"] = featured
+        if min_price is not None or max_price is not None:
+            q["price"] = {k: v for k, v in [("$gte", min_price), ("$lte", max_price)] if v is not None}
+        if search:
+            q["$or"] = [
+                {"title": {"$regex": search, "$options": "i"}}, 
+                {"make": {"$regex": search, "$options": "i"}},
+                {"model": {"$regex": search, "$options": "i"}},
+                {"vin": {"$regex": search, "$options": "i"}},
+                {"stock_number": {"$regex": search, "$options": "i"}}
+            ]
+        total = await db.vehicles.count_documents(q)
+        docs = await db.vehicles.find(q).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+        vehicles = []
+        for d in docs:
+            d["_id"] = str(d["_id"])
+            vehicles.append(d)
+        return {"vehicles": vehicles, "total": total}
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return {"vehicles": [], "total": 0}
+
+@api_router.get("/vehicles/{vehicle_id}")
+async def get_vehicle(vehicle_id: str):
+    if not ObjectId.is_valid(vehicle_id): raise HTTPException(400, "Invalid ID")
+    doc = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
+    if not doc: raise HTTPException(404, "Vehicle not found")
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+@api_router.post("/vehicles")
+async def create_vehicle(data: VehicleCreate, cu=Depends(get_current_user)):
+    doc = {**data.model_dump(), "created_at": datetime.now(timezone.utc)}
+    res = await db.vehicles.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return doc
+
+@api_router.put("/vehicles/{vehicle_id}")
+async def update_vehicle(vehicle_id: str, data: VehicleUpdate, cu=Depends(get_current_user)):
+    if not ObjectId.is_valid(vehicle_id): raise HTTPException(400, "Invalid ID")
+    upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    await db.vehicles.update_one({"_id": ObjectId(vehicle_id)}, {"$set": upd})
+    doc = await db.vehicles.find_one({"_id": ObjectId(vehicle_id)})
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+@api_router.delete("/vehicles/bulk/delete")
+async def bulk_delete_vehicles(vehicle_ids: List[str], cu=Depends(get_current_user)):
+    oids = [ObjectId(vid) for vid in vehicle_ids if ObjectId.is_valid(vid)]
+    if not oids: raise HTTPException(400, "No valid IDs")
+    await db.vehicles.delete_many({"_id": {"$in": oids}})
+    return {"message": "Deleted"}
+
+@api_router.delete("/vehicles/{vehicle_id}")
+async def delete_vehicle(vehicle_id: str, cu=Depends(get_current_user)):
+    if not ObjectId.is_valid(vehicle_id): raise HTTPException(400, "Invalid ID")
+    await db.vehicles.delete_one({"_id": ObjectId(vehicle_id)})
+    return {"message": "Deleted"}
+
+@api_router.post("/vehicles/import")
+async def import_vehicles(file: UploadFile = File(...), cu=Depends(get_current_user)):
+    content = await file.read()
+    decoded = content.decode("utf-8-sig", errors="ignore")
+    reader = csv.DictReader(io.StringIO(decoded), skipinitialspace=True)
+    added = 0
+    
+    # Normalize keys for fuzzy mapping
+    def get_val(row, aliases):
+        for alias in aliases:
+            # Check for exact match, lowercase match, and stripped match
+            for key in row.keys():
+                k = str(key).lower().strip().replace(" ", "_").replace("#", "")
+                if k == alias.lower().replace(" ", "_").replace("#", ""):
+                    return str(row[key]).strip()
+        return ""
+
+    for row in reader:
+        try:
+            # Fuzzy Map Fields
+            vin = get_val(row, ["vin", "vehicle identification number", "vin#"])
+            stock = get_val(row, ["stock_number", "stock", "stk", "stk#", "stock#", "inventory_id"])
+            
+            # Skip placeholders that cause collisions
+            id_blacklist = ["", "n/a", "none", "pending", "unknown", "null"]
+            clean_vin = vin.lower().strip() if vin else ""
+            clean_stock = stock.lower().strip() if stock else ""
+            
+            use_vin = vin.strip() if clean_vin not in id_blacklist else ""
+            use_stock = stock.strip() if clean_stock not in id_blacklist else ""
+
+            # WE MUST HAVE AT LEAST ONE UNIQUE ID
+            if not use_vin and not use_stock:
+                continue
+
+            # Map the rest of the data
+            title = get_val(row, ["title", "headline", "name"])
+            make = get_val(row, ["make", "brand", "manufacturer"])
+            model = get_val(row, ["model", "series"])
+            year_val = get_val(row, ["year", "model_year"])
+            price_val = get_val(row, ["price", "msrp", "retail_price", "sale_price"])
+            mileage_val = get_val(row, ["mileage", "miles", "kms", "odometer"])
+            images_val = get_val(row, ["images", "photos", "image_urls", "urls"])
+            body = get_val(row, ["body_type", "body", "style", "type"])
+            cond = get_val(row, ["condition", "status"])
+            desc = get_val(row, ["description", "notes", "comments", "details"])
+            
+            fuel = get_val(row, ["fuel_type", "fuel", "gas_type"])
+            trans = get_val(row, ["transmission", "trans", "gearbox"])
+            ext_color = get_val(row, ["exterior_color", "color", "ext_color", "exterior"])
+            int_color = get_val(row, ["interior_color", "int_color", "interior"])
+            eng = get_val(row, ["engine", "motor", "engine_size"])
+            drive = get_val(row, ["drivetrain", "drive", "awd_fwd_rwd"])
+
+            imgs = [img.strip() for img in re.split(r'[\s\n]+|,\s*(?=http)', images_val) if img.strip() and img.startswith("http")]
+            
+            v_data = {
+                "title": title if title else f"{year_val} {make} {model}".strip(),
+                "make": make,
+                "model": model,
+                "year": int(year_val) if year_val.isdigit() else 2024,
+                "price": float(re.sub(r'[^\d.]', '', price_val)) if price_val else 0.0,
+                "mileage": int(re.sub(r'[^\d]', '', mileage_val)) if mileage_val else 0,
+                "condition": cond.lower() if cond else "used",
+                "body_type": body if body else "Sedan",
+                "fuel_type": fuel,
+                "transmission": trans,
+                "exterior_color": ext_color,
+                "interior_color": int_color,
+                "engine": eng,
+                "drivetrain": drive,
+                "vin": use_vin,
+                "stock_number": use_stock,
+                "description": desc,
+                "images": imgs,
+                "status": "available"
+            }
+
+            # SMART UPSERT: Priority 1: VIN, Priority 2: Stock
+            query = {}
+            if use_vin:
+                query = {"vin": use_vin}
+            else:
+                query = {"stock_number": use_stock}
+
+            # Check if exists to preserve created_at
+            existing = await db.vehicles.find_one(query)
+            if existing:
+                await db.vehicles.update_one({"_id": existing["_id"]}, {"$set": v_data})
+            else:
+                v_data["created_at"] = datetime.now(timezone.utc)
+                v_data["featured"] = False
+                v_data["show_on_home"] = False
+                await db.vehicles.insert_one(v_data)
+            
+            added += 1
+        except Exception as e:
+            logger.error(f"CSV Row error: {e}")
+            
+    return {"message": f"Inventory sync complete. Processed {added} vehicles."}
+
+@api_router.get("/leads")
+async def list_leads(cu=Depends(get_current_user)):
+    if "leads" not in (await db.list_collection_names()): return []
+    docs = await db.leads.find({}).sort("created_at", -1).to_list(100)
+    for d in docs: d["_id"] = str(d["_id"])
+    return docs
+
+@api_router.post("/leads")
+async def create_lead(data: LeadCreate):
+    lead_doc = {**data.model_dump(), "created_at": datetime.now(timezone.utc), "status": "new"}
+    res = await db.leads.insert_one(lead_doc)
+    lead_doc["_id"] = str(res.inserted_id)
+    return lead_doc
+
+@api_router.get("/leads/export")
+async def export_leads(cu=Depends(get_current_user)):
+    try:
+        leads = await db.leads.find({}).sort("created_at", -1).to_list(1000)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Date", "Name", "Email", "Phone", "Type", "Vehicle", "VIN", "Status", "Message/Transcript"])
+        
+        for l in leads:
+            writer.writerow([
+                l.get("created_at", "").isoformat() if isinstance(l.get("created_at"), datetime) else l.get("created_at", ""),
+                l.get("name", ""),
+                l.get("email", ""),
+                l.get("phone", ""),
+                l.get("lead_type", ""),
+                l.get("vehicle_title", ""),
+                l.get("vehicle_vin", ""),
+                l.get("status", "new"),
+                l.get("message", "")
+            ])
+            
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=autonorth_leads_{datetime.now().strftime('%Y%m%d')}.csv"}
+        )
+    except Exception as e:
+        logger.error(f"Lead Export Error: {e}")
+        raise HTTPException(500, "Export failed")
+
+@api_router.post("/leads/clear")
+async def clear_leads(cu=Depends(get_current_user)):
+    await db.leads.delete_many({})
+    return {"message": "All leads cleared"}
+
+@api_router.put("/leads/{id}")
+async def update_lead_status(id: str, data: dict, cu=Depends(get_current_user)):
+    status = data.get("status")
+    if not status: raise HTTPException(400, "Status required")
+    await db.leads.update_one({"_id": ObjectId(id)}, {"$set": {"status": status}})
+    return {"message": "Status updated"}
+
+@api_router.delete("/leads/{id}")
+async def delete_lead(id: str, cu=Depends(get_current_user)):
+    await db.leads.delete_one({"_id": ObjectId(id)})
+    return {"message": "Lead deleted"}
+
+@api_router.get("/scraper/settings")
+async def get_scraper_settings(cu=Depends(get_current_user)):
+    return {"auto_sync": False, "last_sync": None}
+
+@api_router.post("/scraper/import-url")
+async def import_vehicle_from_url(data: Dict[str, str], cu=Depends(get_current_user)):
+    raw_urls = data.get("url", "")
+    urls = [u.strip() for u in raw_urls.split("\n") if u.strip()]
+    from scraper import scrape_teamford_listing
+    results = []
+    for url in urls:
+        try:
+            v_data = await scrape_teamford_listing(url)
+            if not v_data: continue
+            vin = v_data.get("vin")
+            existing = await db.vehicles.find_one({"vin": vin}) if vin else None
+            if existing:
+                await db.vehicles.update_one({"_id": existing["_id"]}, {"$set": v_data})
+                results.append({"status": "updated", "url": url})
+            else:
+                await db.vehicles.insert_one(v_data)
+                results.append({"status": "imported", "url": url})
+        except: pass
+    return {"results": results}
+
+@api_router.post("/scraper/sync/teamford")
+async def sync_teamford_scraper(cu=Depends(get_current_user)):
+    from scraper import sync_teamford_listings
+    try:
+        sync_result = await sync_teamford_listings()
+        return {"message": "Team Ford sync complete", "imported": sync_result.get("imported", 0), "updated": sync_result.get("updated", 0)}
+    except Exception as e:
+        logger.error(f"Team Ford sync error: {e}")
+        raise HTTPException(500, "Failed to sync with Team Ford")
+
+async def get_ai_response(message: str, inventory_docs: list):
+    """Indestructible AI Engine with Global Health Monitoring"""
+    # ΓöÇΓöÇ 1. Secure Settings Loader (Safe from None/Empty) ΓöÇΓöÇ
+    s = await db.settings.find_one({"type": "general"}) or {}
+    provider_raw = s.get("ai_provider") or os.environ.get("AI_PROVIDER") or "local"
+    provider = str(provider_raw).lower()
+    api_key = s.get("ai_api_key") or os.environ.get("AI_API_KEY")
+    custom_model = s.get("ai_model")
+    
+    def safe_price(v):
+        try:
+            p = v.get('price', 0)
+            if p is None: return 0.0
+            return float(str(p).replace('$', '').replace(',', ''))
+        except: return 0.0
+
+    # ΓöÇΓöÇ 2. The 'Local Brain' (Works Offline / Fallback) ΓöÇΓöÇ
+    async def local_fallback(msg, docs):
+        query = str(msg or "").lower()
+        price_match = re.search(r'(?:under|below|less than|max|up to|around|within)\s*\$?(\d+(?:k|000)?)', query)
+        max_price = 1000000
+        if price_match:
+            p_val = price_match.group(1).replace('k', '000')
+            try: max_price = float(p_val)
+            except: pass
+
+        matches = []
+        for v in docs:
+            p = safe_price(v)
+            if p <= max_price:
+                # Fuzzy keyword matching
+                keywords = [v.get('make'), v.get('model'), v.get('body_type'), v.get('title')]
+                if any(str(k or "").lower() in query for k in keywords):
+                    matches.append(f"{v.get('year')} {v.get('make')} {v.get('model')} (${p:,.0f})")
+        
+        # Log health as 'local'
+        await db.settings.update_one({"type": "general"}, {"$set": {"ai_health": "local", "last_active": datetime.now(timezone.utc)}})
+        
+        if matches:
+            return f"Specialist here! I found {len(matches)} matches. Top picks: {', '.join(matches[:3])}. Would you like more details or a test drive?"
+        return f"We have {len(docs)} vehicles available! What are you looking for? (e.g. Ford, SUV, under $30k)"
+
+    # Force Local if requested
+    if provider == "local" or not api_key:
+        return await local_fallback(message, inventory_docs)
+
+    # ΓöÇΓöÇ 3. The 'Global Brain' (Cloud Providers) ΓöÇΓöÇ
+    try:
+        # ΓöÇΓöÇ 1. Create a Clean, Human-Readable Inventory Summary ΓöÇΓöÇ
+        inventory_summary = "\n".join([
+            f"ΓÇó {v.get('year')} {v.get('make')} {v.get('model')} - ${safe_price(v):,.0f} (Link: [View Detail](/vehicle/{str(v.get('_id', ''))}))" 
+            for v in inventory_docs[:15]
+        ])
+        
+        system_prompt = (
+            "You are the AutoNorth AI Specialist. Professional, luxury-focused, and highly sales-oriented. "
+            "Your goal is to help visitors find their perfect vehicle and capture their contact info. "
+            "IMPORTANT: When listing vehicles, NEVER show the raw 'Vehicle ID' string (e.g., 69ecb9...). "
+            "ALWAYS use the 'Year Make Model' as the title. "
+            "When mentioning a vehicle, ALWAYS use this exact link format: [Year Make Model](/vehicle/ID). "
+            "Use markdown tables for comparisons, but keep the first column as the vehicle name, NOT the ID. "
+            "Always end with a strong, helpful call to action to book a test drive. "
+            f"Current Fleet Context:\n{inventory_summary}\nTotal vehicles available: {len(inventory_docs)}."
+        )
+        
+        # ΓöÇΓöÇ Gemini ΓöÇΓöÇ
+        if provider == "gemini":
+            if not HAS_GENAI:
+                return "AI Specialist is currently offline (SDK missing). Please call 825-605-5050."
+            ai_client = genai.Client(api_key=api_key)
+            resp = ai_client.models.generate_content(model=custom_model or 'gemini-1.5-flash', config=genai.types.GenerateContentConfig(system_instruction=system_prompt), contents=message)
+            await db.settings.update_one({"type": "general"}, {"$set": {"ai_health": "online", "last_active": datetime.now(timezone.utc)}})
+            return resp.text
+
+        # ΓöÇΓöÇ Claude ΓöÇΓöÇ
+        elif provider == "claude":
+            async with httpx.AsyncClient() as client:
+                resp = await client.post("https://api.anthropic.com/v1/messages", 
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": custom_model or 'claude-3-haiku-20240307', "max_tokens": 512, "system": system_prompt, "messages": [{"role": "user", "content": message}]}, timeout=15.0)
+                await db.settings.update_one({"type": "general"}, {"$set": {"ai_health": "online", "last_active": datetime.now(timezone.utc)}})
+                return resp.json()["content"][0]["text"]
+
+        # ΓöÇΓöÇ OpenRouter ΓöÇΓöÇ
+        elif provider == "openrouter":
+            async with httpx.AsyncClient() as client:
+                resp = await client.post("https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "HTTP-Referer": "https://autonorth.ca", "X-Title": "AutoNorth"},
+                    json={"model": custom_model or 'openrouter/auto', "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": message}]}, timeout=15.0)
+                r_json = resp.json()
+                if "choices" in r_json:
+                    await db.settings.update_one({"type": "general"}, {"$set": {"ai_health": "online", "last_active": datetime.now(timezone.utc)}})
+                    return r_json["choices"][0]["message"]["content"]
+                raise Exception(r_json.get("error", {}).get("message", "API Error"))
+
+    except Exception as e:
+        logger.error(f"Global AI Fail ({provider}): {e}")
+        await db.settings.update_one({"type": "general"}, {"$set": {"ai_health": "error", "ai_error": str(e), "last_active": datetime.now(timezone.utc)}})
+        return await local_fallback(message, inventory_docs)
+
+# --- Diagnostic Routes ---
+@api_router.get("/health")
+async def health_check():
+    return {
+        "status": "online",
+        "has_genai": HAS_GENAI,
+        "db_connected": db is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@api_router.get("/debug")
+async def debug_info():
+    return {
+        "env_keys": list(os.environ.keys()),
+        "mongo_url_found": bool(os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URL')),
+        "db_name": db_name,
+        "python_version": sys.version
+    }
+
+@api_router.post("/chat")
+async def ai_chat(data: ChatRequest):
+    try:
+        # ΓöÇΓöÇ 1. Fetch Context ΓöÇΓöÇ
+        docs = await db.vehicles.find({"status": "available"}).sort("created_at", -1).to_list(100)
+        
+        # ΓöÇΓöÇ 2. Get Intelligence Response ΓöÇΓöÇ
+        response_text = await get_ai_response(data.message, docs)
+        
+        # ΓöÇΓöÇ 3. AUTOMATIC LEAD EXTRACTION (The 'Killer' Feature) ΓöÇΓöÇ
+        # Scan for phone numbers (aggressive 10-digit match) and emails
+        phone_match = re.search(r'(\d{10}|\d{3}[-\.\s]??\d{3}[-\.\s]??\d{4}|\(\d{3}\)\s*\d{3}[-\.\s]??\d{4})', data.message)
+        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', data.message)
+        
+        lead_captured = False
+        if phone_match or email_match:
+            phone = phone_match.group(0) if phone_match else None
+            email = email_match.group(0) if email_match else None
+            
+            # Fetch vehicle details if context exists
+            v_title = "General Inquiry"
+            v_vin = "ΓÇö"
+            if data.vehicle_id:
+                try:
+                    v_doc = await db.vehicles.find_one({"_id": ObjectId(data.vehicle_id)})
+                    if v_doc:
+                        v_title = f"{v_doc.get('year')} {v_doc.get('make')} {v_doc.get('model')}"
+                        v_vin = v_doc.get('vin', 'ΓÇö')
+                except: pass
+
+            # Save the lead automatically with FULL TRANSCRIPT
+            lead_doc = {
+                "name": "AI Chat Visitor",
+                "email": email,
+                "phone": phone,
+                "lead_type": "chat_capture",
+                "vehicle_id": data.vehicle_id,
+                "vehicle_title": v_title,
+                "vehicle_vin": v_vin,
+                "message": f"CONVERSATION TRANSCRIPT:\nUser: {data.message}\nAI: {response_text}\n\n(Full history available in chat logs)",
+                "status": "new",
+                "created_at": datetime.now(timezone.utc)
+            }
+            await db.leads.insert_one(lead_doc)
+            lead_captured = True
+            logger.info(f"AI Lead Captured: {email or phone} for {v_title} (VIN: {v_vin})")
+
+        return {"response": response_text, "lead_captured": lead_captured}
+    except Exception as e:
+        logger.error(f"Chat Endpoint Error: {e}")
+        return {"response": "Specialist connection issueΓÇöcall 825-605-5050."}
+
+@app.on_event("startup")
+async def startup():
+    # Ensure DB is ready
+    get_db()
+
+app.include_router(api_router)

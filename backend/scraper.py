@@ -1,283 +1,538 @@
-"""
-AutoNorth scraper + zero-cost intelligent chatbot fallback.
-
-- `scrape_teamford_listing(url)`: pulls vehicle data from a teamford.ca VDP.
-- `NeuralKnowledge.smart_reply(msg, inventory)`: rules-based AI specialist
-  used when no Gemini API key is configured.
-"""
-from __future__ import annotations
-
-import re
-import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
 import httpx
-from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+from bson import ObjectId
+import json
+import logging
+import asyncio
+import re
+import math
+from typing import Optional, Dict, Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
-
-# ───────────────────────── Scraper ─────────────────────────────────
-
-
-async def scrape_teamford_listing(url: str) -> Optional[Dict[str, Any]]:
-    """Best-effort HTML scrape. Returns vehicle dict or None."""
-    if not url.startswith("http"):
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": UA}) as cx:
-            r = await cx.get(url)
-            if r.status_code >= 400:
-                return None
-            html = r.text
-    except Exception as e:
-        logger.warning(f"Fetch failed {url}: {e}")
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    def first_text(*selectors):
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el and el.get_text(strip=True):
-                return el.get_text(" ", strip=True)
-        return ""
-
-    title = first_text("h1", '[class*="vehicle-title"]', '[class*="vdp-title"]', "title")
-    price_text = first_text('[class*="price"]', '[data-price]')
-    price = _parse_int(price_text)
-    year = _parse_year(title)
-    make_model = re.sub(r"^\s*\d{4}\s*", "", title).strip()
-    parts = make_model.split()
-    make = parts[0] if parts else ""
-    model = " ".join(parts[1:3]) if len(parts) > 1 else ""
-
-    # collect images
-    imgs = []
-    for img in soup.find_all("img"):
-        src = img.get("data-src") or img.get("src") or ""
-        if src.startswith("http") and not any(k in src for k in ("logo", "icon", "sprite")):
-            if src not in imgs:
-                imgs.append(src)
-        if len(imgs) >= 20:
-            break
-
-    vin = ""
-    m = re.search(r"\bVIN[:\s]*([A-HJ-NPR-Z0-9]{17})", html, re.I)
-    if m:
-        vin = m.group(1).upper()
-
-    stock = ""
-    m = re.search(r"\bStock(?: ?#|:)\s*([A-Z0-9-]+)", html, re.I)
-    if m:
-        stock = m.group(1)
-
-    mileage = 0
-    m = re.search(r"([\d,]+)\s*km", html, re.I)
-    if m:
-        mileage = _parse_int(m.group(1))
-
-    if not (title or vin or price):
-        return None
-
-    return {
-        "title": title or f"{year or ''} {make} {model}".strip(),
-        "make": make,
-        "model": model,
-        "year": year or 2024,
-        "price": price or 0,
-        "mileage": mileage,
-        "vin": vin,
-        "stock_number": stock,
-        "images": imgs[:15],
-        "status": "available",
-        "source_url": url,
-        "imported_at": datetime.now(timezone.utc),
-    }
-
-
-def _parse_int(s: str) -> int:
-    if not s:
-        return 0
-    nums = re.sub(r"[^\d]", "", s)
-    return int(nums) if nums else 0
-
-
-def _parse_year(s: str) -> Optional[int]:
-    m = re.search(r"\b(19|20)\d{2}\b", s or "")
-    return int(m.group(0)) if m else None
-
-
-# ───────────────────── Local intelligent chatbot ───────────────────
-
+# DEFINITIVE ALGOLIA CREDENTIALS
+ALGOLIA_APP_ID = "VBAFQME90B"
+ALGOLIA_API_KEY = "650a66d4bf074b5de276a2ecb945bf80"
+ALGOLIA_URL = f"https://{ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/*/queries"
 
 class NeuralKnowledge:
-    """Zero-cost intelligent chatbot. Understands intent and inventory."""
+    """
+    NEURAL KNOWLEDGE ENGINE:
+    Acts as a high-intelligence 'Local Brain' that mimics advanced LLMs using 
+    semantic pattern matching and inventory-aware synthesis.
+    """
+    @staticmethod
+    def extract_intent(msg: str):
+        msg = msg.lower()
+        patterns = {
+            "GREETING": r"\b(hi|hello|hey|morning|good afternoon|howdy|greetings)\b",
+            "INVENTORY_SEARCH": r"\b(looking for|have|stock|inventory|cars|trucks|suvs|autos|vehicles)\b",
+            "FINANCE": r"\b(finance|credit|loan|approve|monthly|payments|rate|interest|down payment)\b",
+            "CONTACT": r"\b(location|where|address|phone|number|contact|call|email)\b",
+            "BOOKING": r"\b(book|schedule|test drive|view|visit|appointment)\b",
+            "DEAL": r"\b(deal|best price|special|discount|offer|cheapest|lowest)\b",
+            "CONFIRMATION": r"\b(yes|yeah|sure|ok|okay|please|book it|do it)\b"
+        }
+        for intent, pattern in patterns.items():
+            if re.search(pattern, msg):
+                return intent
+        return "GENERAL"
 
-    GREETINGS = ("hi", "hello", "hey", "good morning", "good afternoon", "good evening", "yo", "howdy")
-    LEAD_INTENTS = ("test drive", "book", "appointment", "visit", "see it", "come in", "buy", "interested",
-                    "call me", "contact me", "purchase", "trade in", "trade-in", "financing", "pre-approved",
-                    "pre approval", "preapproval", "schedule")
-    BUY_PHRASES = ("looking for", "need a", "want a", "show me", "find me", "search for", "do you have",
-                   "any", "got any", "available")
+    @staticmethod
+    def analyze_inventory(msg: str, inventory: List[Dict]):
+        msg = msg.lower()
+        # Find Make matches
+        makes = ["ford", "ram", "chevrolet", "toyota", "honda", "jeep", "dodge", "nissan", "hyundai", "kia", "bmw", "mercedes"]
+        found_make = next((m for m in makes if m in msg), None)
+        
+        # Find Body Type matches
+        types = ["truck", "suv", "sedan", "van", "coupe", "convertible"]
+        found_type = next((t for t in types if t in msg), None)
+        
+        results = []
+        if found_make:
+            results = [v for v in inventory if found_make in v.get('make', '').lower()]
+        elif found_type:
+            results = [v for v in inventory if found_type in v.get('body_type', '').lower() or found_type in v.get('title', '').lower()]
+        
+        if not results and inventory:
+            results = sorted(inventory, key=lambda x: x.get('price', 999999))[:3]
+            
+        return results, found_make or found_type
 
-    BODY_KEYWORDS = {
-        "truck": "Truck", "trucks": "Truck", "pickup": "Truck", "f-150": "Truck", "f150": "Truck",
-        "suv": "SUV", "suvs": "SUV", "explorer": "SUV", "edge": "SUV", "escape": "SUV", "expedition": "SUV",
-        "sedan": "Sedan", "sedans": "Sedan", "fusion": "Sedan",
-        "coupe": "Coupe", "mustang": "Coupe", "sports car": "Coupe",
-        "van": "Van", "transit": "Van", "cargo": "Van",
-    }
+    @classmethod
+    async def generate_response(cls, msg: str, inventory: List[Dict], provider: str = "local", api_key: str = "", model: str = ""):
+        """
+        GENERATE RESPONSE:
+        High-performance intelligence engine with multi-provider support 
+        and deep Edmonton/Alberta location awareness.
+        """
+        intent = NeuralKnowledge.extract_intent(msg)
+        results, entity = NeuralKnowledge.analyze_inventory(msg, inventory)
+        
+        # 1. LOCATION CONTEXT LAYER (Edmonton/Alberta specific)
+        loc_context = "AutoNorth Motors is located at 9104 91 St NW, Edmonton, AB T6C 3N5. "
+        winter_advice = "For Edmonton winters, we highly recommend AWD or 4WD vehicles. "
+        
+        # 2. LOCAL BRAIN (Priority Local Synthesis)
+        if provider == "local" or not api_key:
+            if intent == "GREETING":
+                return "Welcome to AutoNorth Motors! I'm your AI Automotive Specialist. I'm connected to our live Edmonton inventory—are you searching for a specific make, looking for a deal, or interested in financing?"
+            
+            if intent == "CONTACT":
+                return f"{loc_context}You can reach our sales floor directly at 825-605-5050. Would you like me to send these details to your phone?"
+            
+            if intent == "FINANCE":
+                return "Our 'AutoNorth Credit Brain' analyzes your situation to find the lowest possible rates in Alberta. We specialize in all credit types—from perfect to rebuilding. Shall I start your application?"
+            
+            if intent == "DEAL":
+                specials = [v for v in inventory if v.get('is_on_special')]
+                if specials:
+                    s = specials[0]
+                    return f"I have a high-value deal right now: A {s.get('title')} originally priced higher, now available for ${s.get('price', 0):,.0f}. This is our top-tier special this week. Interest?"
+                if inventory:
+                    cheapest = sorted(inventory, key=lambda x: x.get('price', 0))[0]
+                    return f"The best entry-point in our current inventory is the {cheapest.get('title')} for only ${cheapest.get('price', 0):,.0f}. It's a great balance of value and reliability."
+                return "I'm checking our incoming manifest. We receive new inventory daily. What specifically should I keep an eye out for?"
 
-    FUEL_KEYWORDS = {
-        "electric": "Electric", "ev": "Electric", "tesla": "Electric",
-        "hybrid": "Hybrid", "plug-in": "Hybrid", "phev": "Hybrid",
-        "diesel": "Diesel",
-        "gas": "Gas", "gasoline": "Gas", "petrol": "Gas",
-    }
+            if intent == "BOOKING":
+                return "I can secure a VIP viewing and test drive for you. Which day this week works best? I'll coordinate everything with a product specialist."
 
-    # ── Public entry point ────────────────────────────────────────
+            if intent == "INVENTORY_SEARCH" or entity:
+                if results:
+                    top = results[0]
+                    others = len(results) - 1
+                    resp = f"I've analyzed our live stock: The **{top.get('title')}** (priced at **${top.get('price', 0):,.0f}**) perfectly matches your request. "
+                    if others > 0:
+                        resp += f"I also have {others} other similar models available. "
+                    resp += "\n\nWould you like to see the full spec sheet or book a viewing at our Edmonton showroom?"
+                    return resp
+                return "I'm checking our incoming manifest. We receive new inventory daily. What specifically should I keep an eye out for?"
+
+            return "I'm the AutoNorth Intelligence Engine. I can analyze our vehicle feed, explain financing options, or book your VIP test drive in Edmonton. How can I best serve you today?"
+
+        # 3. GLOBAL BRAIN (AI Providers)
+        # Context-aware prompt for AI providers
+        # Clean context for JSON serialization (remove/string-ify non-serializable objects)
+        clean_results = []
+        for res in results[:5]:
+            clean_res = {}
+            for k, v in res.items():
+                if k == '_id': continue
+                if isinstance(v, datetime):
+                    clean_res[k] = v.isoformat()
+                else:
+                    clean_res[k] = v
+            clean_results.append(clean_res)
+            
+        v_context = json.dumps(clean_results)
+        system_prompt = f"""You are the AutoNorth Motors AI Specialist, an elite automotive concierge in Edmonton, Alberta.
+        
+        Current Intent: {intent}
+        Location Context: {loc_context} {winter_advice}
+        Relevant Inventory: {v_context}
+        
+        Instructions:
+        - Be professional, helpful, and luxury-oriented.
+        - Emphasize that we serve Edmonton, Sherwood Park, St. Albert, and the greater Alberta area.
+        - Mention specific vehicle highlights (price, mileage, features) if they match the user's query.
+        - ALWAYS use this link format for vehicles: [Year Make Model](/vehicle/ID).
+        - Use markdown for bolding and tables. Always drive the user towards a test drive or call (825-605-5050).
+        """
+
+        # AI Providers
+        ai_response = None
+        
+        # 3. OPENROUTER PROVIDER
+        if provider == "openrouter" and api_key:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "HTTP-Referer": "https://autonorth.ca", "X-Title": "AutoNorth AI"},
+                        json={"model": model or "openrouter/auto", "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": msg}]}
+                    )
+                    if resp.status_code == 200:
+                        ai_response = resp.json()['choices'][0]['message']['content']
+            except Exception as e:
+                logger.error(f"OpenRouter exception: {str(e)}")
+
+        # 4. CLAUDE PROVIDER
+        elif provider == "claude" and api_key:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                        json={"model": model or "claude-3-haiku-20240307", "max_tokens": 1024, "system": system_prompt, "messages": [{"role": "user", "content": msg}]}
+                    )
+                    if resp.status_code == 200:
+                        ai_response = resp.json()["content"][0]["text"]
+            except Exception as e:
+                logger.error(f"Claude exception: {str(e)}")
+
+        # 5. GEMINI PROVIDER (NEW SDK)
+        elif provider == "gemini" and api_key:
+            try:
+                from google import genai
+                client = genai.Client(api_key=api_key)
+                
+                # Context-aware system prompt
+                v_context = json.dumps(clean_results)
+                system_instruction = f"""You are 'Alpha', the AutoNorth Motors AI vehicle specialist in Edmonton. 
+                Confident, professional, and luxury-oriented. 
+                Location: 9104 91 St NW, Edmonton. Phone: 825-605-5050.
+                
+                Current Intent: {intent}
+                Relevant Inventory: {v_context}
+                
+                Instructions:
+                - Emphasize zero dealer fees and Edmonton local service.
+                - Use markdown for bolding and tables.
+                - ALWAYS drive the user towards a test drive or call.
+                - Use this format for vehicles: [Year Make Model](/vehicle/ID).
+                """
+                
+                chat = client.chats.create(
+                    model=model or "gemini-1.5-flash",
+                    config=genai.types.GenerateContentConfig(system_instruction=system_instruction)
+                )
+                response = chat.send_message(msg)
+                ai_response = response.text
+            except Exception as e:
+                logger.error(f"Gemini (New SDK) exception: {str(e)}")
+
+        if ai_response:
+            return ai_response
+
+        # FINAL FALLBACK: Local Intelligence (triggered if AI fails or is not configured)
+        reply, _ = cls.smart_reply(msg, inventory)
+        return reply
+
     @classmethod
     def smart_reply(cls, message: str, inventory: List[Dict[str, Any]]) -> Tuple[str, bool]:
+        """Rules-based intelligent specialist for offline/fallback modes."""
         msg = (message or "").lower().strip()
         if not msg:
-            return ("Tell me what you're looking for — a truck, SUV, EV, family ride? "
-                    "I'll show you what we have in stock right now.", False)
+            return ("Tell me what you're looking for — a truck, SUV, EV, family ride? I'll show you what we have in stock right now.", False)
 
-        lead_captured = cls.detect_lead_intent(msg)
+        lead_intents = ("test drive", "book", "appointment", "visit", "see it", "come in", "buy", "interested", "call me", "contact me")
+        lead_captured = any(k in msg for k in lead_intents)
 
         # Greeting
-        if any(msg.startswith(g) for g in cls.GREETINGS) and len(msg.split()) <= 4:
-            return (
-                "Hey! Welcome to AutoNorth Motors in Edmonton. I know every vehicle on our lot — "
-                "what kind of ride are you looking for? Trucks, SUVs, EVs, family sedans? "
-                "Or tell me your budget and I'll match you up.", lead_captured)
+        if any(msg.startswith(g) for g in ("hi", "hello", "hey", "good morning", "good afternoon")) and len(msg.split()) <= 4:
+            return ("Hey! Welcome to AutoNorth Motors in Edmonton. I'm connected to our live inventory — what kind of ride are you looking for today?", lead_captured)
 
-        # Pricing / financing intent
-        if any(k in msg for k in ("financing", "finance", "loan", "monthly", "payment", "credit", "approval")):
-            return (
-                "We get every credit profile approved — typically in under 10 minutes. "
-                "Best part: zero dealer fees, ever. Want me to send you the financing application, "
-                "or pair you with a vehicle in your monthly budget? Tell me your target payment.",
-                True)
+        # Financing
+        if any(k in msg for k in ("financing", "finance", "loan", "monthly", "payment", "credit")):
+            return ("We specialize in getting every credit profile approved, typically in under 10 minutes. Best part: zero dealer fees, ever. Shall I start your application?", True)
 
-        # Test drive / buy intent
-        if any(k in msg for k in cls.LEAD_INTENTS):
-            top = cls._top_matches(msg, inventory, limit=3)
-            lines = "\n".join(cls._format_card(v) for v in top) or "Browse our full inventory at /inventory."
-            return (
-                "Excellent — let's get you behind the wheel. Drop your name and best phone "
-                "number and I'll have a specialist call you within the hour. "
-                "Or call us now at 825-605-5050.\n\n"
-                f"Here are great matches for you:\n{lines}", True)
+        # Inventory search results (if matches found)
+        if inventory:
+            top = inventory[0]
+            others = len(inventory) - 1
+            resp = f"I've analyzed our live stock: The **{top.get('year')} {top.get('make')} {top.get('model')}** (priced at **${top.get('price', 0):,.0f}**) perfectly matches your request. "
+            if others > 0:
+                resp += f"I also have {others} other similar models available. "
+            resp += "\n\nWould you like to see the full spec sheet or book a viewing at our Edmonton showroom?"
+            return resp, lead_captured
 
-        # Contact / hours
-        if any(k in msg for k in ("hours", "open", "address", "location", "where", "direction")):
-            return (
-                "We're at 9104 91 St NW, Edmonton, AB. Open Mon-Fri 9am-8pm, Sat-Sun 10am-6pm. "
-                "Call us at 825-605-5050 or come in for a no-pressure visit.", lead_captured)
+        return ("I don't see an exact match in stock today, but we get new inventory every week. Tell me your must-haves and I'll alert you the moment it lands.", lead_captured)
 
-        # Inventory query — most common
-        candidates = cls._top_matches(msg, inventory, limit=4)
-        if candidates:
-            intro = cls._intent_intro(msg)
-            cards = "\n".join(cls._format_card(v) for v in candidates)
-            tail = "\n\nWant to schedule a test drive on any of these? Just say the word — or ask me anything about specs, financing, or trade-ins."
-            return (f"{intro}\n\n{cards}{tail}", lead_captured)
+def _sanitize(text):
+    if not text: return ""
+    # Remove HTML entities like &nbsp; and multiple spaces
+    text = str(text).replace('&nbsp;', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Fallback to general clean
+    return re.sub(r'[^a-zA-Z0-9\s.,!?&$()-]', '', text).strip()
 
-        # Out-of-stock or no match — soft sell
-        return (
-            "I don't see an exact match in stock today, but we get new inventory every week. "
-            "Tell me your must-haves (body type, year, budget, mileage) and I'll alert you the moment it lands. "
-            "Or call 825-605-5050 and we'll source the right vehicle for you.", lead_captured)
+def _normalize_body_type(raw: Optional[str]) -> str:
+    if not raw: return "Sedan"
+    r = raw.lower()
+    if any(x in r for x in ["truck", "pickup", "cab", "crew", "ext"]): return "Truck"
+    if any(x in r for x in ["suv", "crossover", "utility", "sport"]): return "SUV"
+    if any(x in r for x in ["sedan", "coupe", "hardtop"]): return "Sedan"
+    if any(x in r for x in ["van", "minivan", "cargo"]): return "Van"
+    if "hatch" in r: return "Hatchback"
+    if "wagon" in r: return "Wagon"
+    return "Other"
 
-    @classmethod
-    def detect_lead_intent(cls, message: str) -> bool:
-        m = (message or "").lower()
-        return any(k in m for k in cls.LEAD_INTENTS) or bool(re.search(r"\b\d{3}[-.\s]?\d{3,4}\b", m))
+def _clean_numeric(val: Any) -> float:
+    if not val: return 0
+    if isinstance(val, (int, float)): return float(val)
+    cleaned = re.sub(r'[^\d.]', '', str(val))
+    try: return float(cleaned)
+    except: return 0
 
-    # ── Helpers ───────────────────────────────────────────────────
-    @classmethod
-    def _intent_intro(cls, msg: str) -> str:
-        if "under" in msg or "less than" in msg or "below" in msg:
-            return "Here's what fits your budget right now:"
-        if any(k in cls.BODY_KEYWORDS for k in msg.split()):
-            return "Great choice — these are the strongest options on the lot:"
-        if any(k in msg for k in ("family", "kids", "spacious", "room", "seats")):
-            return "For family-friendly comfort and space, I'd point you here:"
-        if any(k in msg for k in ("fast", "performance", "sport", "powerful", "v8")):
-            return "If you want power and presence, look at these:"
-        if any(k in msg for k in ("efficient", "fuel", "mileage", "economy", "ev", "electric", "hybrid")):
-            return "Fuel-efficient picks built for Alberta winters:"
-        return "Here are some excellent matches from our current inventory:"
+def _parse_teamford_vehicle(h: Dict) -> Dict[str, Any]:
+    """Helper to parse a single vehicle from Algolia hit with robust field mapping."""
+    # Robust Price Extraction
+    price = 0
+    price_fields = ["sort_price", "special_price", "list_price", "regular_price", "retail_price", "msrp"]
+    for field in price_fields:
+        val = h.get(field)
+        price = _clean_numeric(val)
+        if price > 0: break
+    
+    if not price:
+        pricing = h.get("pricing") or {}
+        if isinstance(pricing, dict):
+            price = _clean_numeric(pricing.get("sell_price") or pricing.get("list_price") or 0)
+    
+    # Filter out unrealistic placeholder prices (e.g., 9999999)
+    if price >= 9000000:
+        price = 0 # Mark as "Contact for Price"
+    
+    # Robust Mileage
+    mileage = _clean_numeric(h.get("odometer") or h.get("mileage") or 0)
+    if mileage >= 500000: mileage = 0
 
-    @classmethod
-    def _format_card(cls, v: Dict[str, Any]) -> str:
-        price = v.get("price") or 0
-        miles = v.get("mileage") or 0
-        return (
-            f"• {v.get('year','')} {v.get('make','')} {v.get('model','')} — "
-            f"${price:,.0f} · {miles:,} km · {v.get('body_type','')}"
-        )
+    # Robust Image Construction (Cloudinary)
+    images = []
+    photo_ids = h.get("photo_service_ids") or []
+    if isinstance(photo_ids, list) and photo_ids:
+        base_url = "https://res.cloudinary.com/goauto-images/image/upload/f_auto,c_fill,q_auto,w_1920/v1/"
+        images = [f"{base_url}{pid}.jpg" for pid in photo_ids]
+    
+    if not images:
+        images = [img.get("url") for img in h.get("images", []) if isinstance(img, dict) and img.get("url")]
+    
+    if not images and h.get("thumbnail_url"):
+        images = [h.get("thumbnail_url")]
+    
+    # Robust Identifiers
+    vin = h.get("vin")
+    stock = h.get("stock_number")
+    
+    # Mapping
+    make = h.get("make_name") or h.get("make") or ""
+    model = h.get("model_name") or h.get("model") or ""
+    year = int(h.get("year") or 2024)
+    trim = h.get("published_trim") or h.get("trim") or ""
+    
+    # Cleaner Title Generation
+    clean_trim = trim
+    if len(clean_trim) > 50:
+        clean_trim = clean_trim.split(',')[0].split(';')[0].strip()
+    
+    title = _sanitize(f"{year} {make} {model} {clean_trim}".strip())
+    if not title or title == str(year):
+        title = _sanitize(h.get("title") or f"{year} {make} {model}")
 
-    @classmethod
-    def _top_matches(cls, msg: str, inventory: List[Dict[str, Any]], limit: int = 4) -> List[Dict[str, Any]]:
-        if not inventory:
-            return []
+    # Enhanced Engine Description
+    # Combine litres and config (e.g. 2.3L I4)
+    litres = h.get("engine_litres")
+    config = h.get("engine_config_name") or h.get("engine_description")
+    engine = f"{litres}L {config}" if litres and config else (config or str(litres or ""))
+    engine = _sanitize(engine)
 
-        body = None
-        for kw, b in cls.BODY_KEYWORDS.items():
-            if kw in msg:
-                body = b
-                break
+    # Deal Detection
+    is_special = bool(h.get("special_price") or h.get("is_on_special") or h.get("featured"))
+    if not is_special and price > 0:
+        # If price is significantly below regular price, mark as special
+        reg = _clean_numeric(h.get("regular_price") or h.get("list_price") or 0)
+        if reg > price * 1.05: is_special = True
 
-        fuel = None
-        for kw, f in cls.FUEL_KEYWORDS.items():
-            if kw in msg:
-                fuel = f
-                break
+    # Build description
+    description = h.get("published_notes") or h.get("description") or h.get("comments")
+    if description:
+        # Strip HTML tags and entities
+        description = re.sub('<[^<]+?>', '', description)
+        description = description.replace('&nbsp;', ' ').replace('&amp;', '&')
+        description = _sanitize(description)
+    else:
+        description = f"Certified premium {year} {make} {model} available at AutoNorth Motors. Schedule your test drive today!"
 
-        budget = None
-        m = re.search(r"\$?\s*(\d{1,3}(?:[,\s]?\d{3})+|\d+\s*k)", msg)
-        if m:
-            raw = m.group(1).replace(",", "").replace(" ", "")
-            if raw.endswith("k"):
-                budget = int(raw[:-1]) * 1000
-            elif raw.isdigit():
-                budget = int(raw)
+    return {
+        "vin": vin,
+        "stock_number": stock,
+        "title": title,
+        "make": make,
+        "model": model,
+        "year": year,
+        "price": price,
+        "mileage": int(mileage),
+        "condition": (h.get("stock_type") or "used").lower(),
+        "body_type": _normalize_body_type(h.get("body_type_name") or h.get("body_style") or h.get("body_type_category")),
+        "fuel_type": h.get("fuel_type_category") or h.get("fuel_type_name") or "Gas",
+        "transmission": h.get("transmission_name") or h.get("transmission_desc") or "Automatic",
+        "drivetrain": h.get("drive_type_name") or h.get("drive_type_desc") or "",
+        "exterior_color": h.get("exterior_colour_name") or h.get("exterior_color"),
+        "interior_color": h.get("interior_colour_name") or h.get("interior_color"),
+        "engine": engine,
+        "description": description[:2000], 
+        "features": [_sanitize(f.get("name")) for f in h.get("features", []) if isinstance(f, dict) and f.get("name")],
 
-        def score(v):
-            s = 0
-            if body and (v.get("body_type") or "").lower() == body.lower():
-                s += 10
-            if fuel and (v.get("fuel_type") or "").lower() == fuel.lower():
-                s += 6
-            price = v.get("price") or 0
-            if budget and price and price <= budget:
-                s += 5
-                # closer to budget = better fit
-                s += max(0, 4 - abs(budget - price) // 5000)
-            # term matching against title
-            title = (v.get("title") or "").lower()
-            for token in re.findall(r"[a-z]{3,}", msg):
-                if token in title:
-                    s += 1
-            if v.get("featured"):
-                s += 1
-            return s
+        "images": images,
+        "status": "Available",
+        "is_on_special": is_special,
+        "source": "teamford_sync",
+        "featured": h.get("is_featured", False),
+        "show_on_home": True, # Ensure vehicles appear on the home page by default
+        "source_url": f"https://www.teamford.ca/vehicles/{h.get('slug')}" if h.get('slug') else "",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc)
+    }
 
-        scored = sorted(inventory, key=score, reverse=True)
-        # Filter out zero-score if we have any positives
-        positives = [v for v in scored if score(v) > 0]
-        return (positives or scored)[:limit]
+async def get_sync_info() -> Dict[str, Any]:
+    """Retrieves total counts and page info for syncing."""
+    try:
+        headers = {
+            "x-algolia-api-key": ALGOLIA_API_KEY,
+            "x-algolia-application-id": ALGOLIA_APP_ID,
+            "Content-Type": "application/json"
+        }
+        payload = {"requests": [{"indexName": "inventory", "params": "filters=craft_site_ids%3A34&hitsPerPage=1&page=0"}]}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(ALGOLIA_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            nb_hits = data.get("results", [{}])[0].get("nbHits", 0)
+            return {"total_vehicles": nb_hits, "hits_per_page": 100, "total_pages": math.ceil(nb_hits / 100) if nb_hits else 0}
+    except Exception as e:
+        logger.error(f"Failed to get sync info: {e}")
+        return {"total_vehicles": 0, "hits_per_page": 100, "total_pages": 0}
 
-    # Backward-compat shim used elsewhere
-    @classmethod
-    def generate_response(cls, message: str, inventory: List[Dict[str, Any]]) -> str:
-        reply, _ = cls.smart_reply(message, inventory)
-        return reply
+async def sync_teamford_batch(page: int) -> Dict[str, int]:
+    """Syncs a single page (batch) of vehicles from Team Ford."""
+    logger.info(f"Processing batch page {page}...")
+    try:
+        headers = {
+            "x-algolia-api-key": ALGOLIA_API_KEY,
+            "x-algolia-application-id": ALGOLIA_APP_ID,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.teamford.ca/"
+        }
+        payload = {"requests": [{"indexName": "inventory", "params": f"filters=craft_site_ids%3A34&hitsPerPage=100&page={page}"}]}
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(ALGOLIA_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            hits = resp.json().get("results", [{}])[0].get("hits", [])
+            
+            if not hits: return {"imported": 0, "updated": 0, "count": 0}
+            
+            imported, updated = 0, 0
+            from server import db
+            
+            for h in hits:
+                v = _parse_teamford_vehicle(h)
+                vin, stock = v.get("vin"), v.get("stock_number")
+                if not vin and not stock: continue
+                
+                existing = None
+                if vin: existing = await db.vehicles.find_one({"vin": vin})
+                if not existing and stock: existing = await db.vehicles.find_one({"stock_number": stock})
+                
+
+                if existing:
+                    # Ensure existing vehicles also get timestamps and home visibility if missing
+                    update_fields = {**v, "updated_at": datetime.now(timezone.utc)}
+                    if "created_at" not in existing:
+                        update_fields["created_at"] = existing.get("created_at", datetime.now(timezone.utc))
+                    if "show_on_home" not in existing:
+                        update_fields["show_on_home"] = True
+                    
+                    await db.vehicles.update_one({"_id": existing["_id"]}, {"$set": update_fields})
+                    updated += 1
+                else:
+                    v["created_at"] = datetime.now(timezone.utc)
+                    v["updated_at"] = v["created_at"]
+                    v["show_on_home"] = True # Default for new synced items
+                    await db.vehicles.insert_one(v)
+                    imported += 1
+            
+            return {"imported": imported, "updated": updated, "count": len(hits)}
+    except Exception as e:
+        logger.error(f"Batch sync page {page} failed: {e}")
+        return {"imported": 0, "updated": 0, "count": 0, "error": str(e)}
+
+async def scrape_teamford_inventory(limit: int = 2000) -> List[Dict[str, Any]]:
+    """Legacy helper to scrape all inventory at once. Uses batches to avoid timeouts."""
+    info = await get_sync_info()
+    total_pages = info.get("total_pages", 0)
+    all_vehicles = []
+    
+    headers = {
+        "x-algolia-api-key": ALGOLIA_API_KEY,
+        "x-algolia-application-id": ALGOLIA_APP_ID,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.teamford.ca/"
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for page in range(total_pages):
+            payload = {"requests": [{"indexName": "inventory", "params": f"filters=craft_site_ids%3A34&hitsPerPage=100&page={page}"}]}
+            resp = await client.post(ALGOLIA_URL, json=payload, headers=headers)
+            if resp.status_code == 200:
+                hits = resp.json().get("results", [{}])[0].get("hits", [])
+                for h in hits:
+                    all_vehicles.append(_parse_teamford_vehicle(h))
+                    if len(all_vehicles) >= limit:
+                        return all_vehicles
+            if len(all_vehicles) >= limit: break
+            
+    return all_vehicles
+
+async def sync_teamford_listings() -> Dict[str, int]:
+    """Sync all Team Ford listings to local database."""
+    logger.info("Initiating database sync...")
+    try:
+        vehicles = await scrape_teamford_inventory(limit=2000)
+        if not vehicles:
+            logger.warning("No vehicles scraped. Sync aborted.")
+            return {"imported": 0, "updated": 0, "deleted": 0}
+            
+        imported = 0
+        updated = 0
+        
+        from server import db
+        
+        for v in vehicles:
+            vin = v.get("vin")
+            stock = v.get("stock_number")
+            if not vin and not stock: continue
+            
+            existing = None
+            if vin: existing = await db.vehicles.find_one({"vin": vin})
+            if not existing and stock: existing = await db.vehicles.find_one({"stock_number": stock})
+            
+            if existing:
+                # Update existing
+                await db.vehicles.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {**v, "updated_at": datetime.now(timezone.utc)}}
+                )
+                updated += 1
+            else:
+                # Insert new
+                v["created_at"] = datetime.now(timezone.utc)
+                v["updated_at"] = v["created_at"]
+                v["views"] = 0
+                await db.vehicles.insert_one(v)
+                imported += 1
+        
+        logger.info(f"Sync complete: {imported} imported, {updated} updated.")
+        return {"success": True, "imported": imported, "updated": updated, "deleted": 0}
+    except Exception as e:
+        logger.error(f"Sync failed: {str(e)}", exc_info=True)
+        return {"success": False, "imported": 0, "updated": 0, "deleted": 0}
+
+async def scrape_teamford_listing(url: str) -> Optional[Dict[str, Any]]:
+    """Scrapes a single Team Ford vehicle listing page."""
+    try:
+        slug = url.rstrip('/').split('/')[-1]
+        algolia_headers = {"x-algolia-api-key": ALGOLIA_API_KEY, "x-algolia-application-id": ALGOLIA_APP_ID, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            payload = {"requests": [{"indexName": "inventory", "params": f"query={slug}&hitsPerPage=1&filters=craft_site_ids%3A34"}]}
+            resp = await client.post(ALGOLIA_URL, json=payload, headers=algolia_headers)
+            if resp.status_code == 200:
+                hits = resp.json().get("results", [{}])[0].get("hits", [])
+                if hits: return _parse_teamford_vehicle(hits[0])
+        return None
+    except Exception as e:
+        logger.error(f"Failed to scrape listing {url}: {e}")
+        return None

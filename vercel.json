@@ -1,12 +1,23 @@
 {
-  "rewrites": [
+  "version": 2,
+  "env": {
+    "PYO3_USE_ABI3_FORWARD_COMPATIBILITY": "1",
+    "DISABLE_ESLINT_PLUGIN": "true"
+  },
+  "builds": [
     {
-      "source": "/api/(.*)",
-      "destination": "/api/index.py"
+      "src": "package.json",
+      "use": "@vercel/static-build",
+      "config": { "distDir": "build" }
     },
     {
-      "source": "/(.*)",
-      "destination": "/index.html"
+      "src": "api/index.py",
+      "use": "@vercel/python",
+      "config": { "runtime": "python3.12" }
     }
+  ],
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/index.py" },
+    { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

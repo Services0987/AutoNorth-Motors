@@ -1,0 +1,74 @@
+[32mINFO[0m:     Started server process [[36m409[0m]
+[32mINFO[0m:     Waiting for application startup.
+INFO:server:AutoNorth API ready.
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:8000[0m (Press CTRL+C to quit)
+[32mINFO[0m:     127.0.0.1:44502 - "[1mGET / HTTP/1.1[0m" [31m404 Not Found[0m
+[32mINFO[0m:     127.0.0.1:44502 - "[1mGET /favicon.ico HTTP/1.1[0m" [31m404 Not Found[0m
+[32mINFO[0m:     127.0.0.1:39458 - "[1mGET /api/health HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:49780 - "[1mGET /api/vehicles?limit=1000&t=1777026250527 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:49782 - "[1mGET /api/vehicles?limit=20&skip=0 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:49788 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:49798 - "[1mGET /api/vehicles?limit=1000&t=1777026250547 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:49810 - "[1mGET /api/vehicles?limit=20&skip=0 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:49822 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:40542 - "[1mGET /api/health HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:40552 - "[1mGET /api/vehicles?show_on_home=true&limit=10 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:40568 - "[1mGET /api/vehicles?page=1&limit=20 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:40584 - "[1mPOST /api/chat HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51108 - "[1mPOST /api/chat HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51118 - "[1mPOST /api/auth/login HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     ('127.0.0.1', 51128) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     127.0.0.1:51138 - "[1mGET /api/vehicles?limit=1000&t=1777026539389 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51146 - "[1mGET /api/vehicles?featured=true&limit=4 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51160 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:51164 - "[1mGET /api/vehicles?limit=1000&t=1777026539399 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51180 - "[1mGET /api/vehicles?featured=true&limit=4 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:51190 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     ('127.0.0.1', 51200) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     ('127.0.0.1', 51206) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     127.0.0.1:55790 - "[1mPOST /api/auth/login HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     ('127.0.0.1', 37744) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     127.0.0.1:37750 - "[1mGET /api/vehicles?limit=1000&t=1777026562362 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:37754 - "[1mGET /api/vehicles?limit=20&skip=0 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:37760 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:37776 - "[1mGET /api/vehicles?limit=1000&t=1777026562375 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:37780 - "[1mGET /api/vehicles?limit=20&skip=0 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:37794 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     ('127.0.0.1', 37810) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     ('127.0.0.1', 37812) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     ('127.0.0.1', 37824) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     127.0.0.1:37832 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:37840 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     ('127.0.0.1', 37854) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     ('127.0.0.1', 46834) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     127.0.0.1:46842 - "[1mGET /api/vehicles?limit=1000&t=1777026599716 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:46852 - "[1mGET /api/vehicles?limit=20&skip=0 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:46858 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:46868 - "[1mGET /api/vehicles?limit=1000&t=1777026599723 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:46884 - "[1mGET /api/vehicles?limit=20&skip=0 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:46888 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     ('127.0.0.1', 46890) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed
+[32mINFO[0m:     ('127.0.0.1', 46898) - "WebSocket /ws" 403
+[32mINFO[0m:     connection rejected (403 Forbidden)
+[32mINFO[0m:     connection closed

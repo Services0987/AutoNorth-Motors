@@ -1,0 +1,16 @@
+[32mINFO[0m:     Started server process [[36m1241[0m]
+[32mINFO[0m:     Waiting for application startup.
+INFO:server:Seeded default admin user (admin@autonorth.ca).
+INFO:server:Seeded 20 demo vehicles.
+INFO:server:AutoNorth API ready.
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:8000[0m (Press CTRL+C to quit)
+[32mINFO[0m:     127.0.0.1:48958 - "[1mGET /api/health HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:48258 - "[1mPOST /api/chat HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:48264 - "[1mGET /api/vehicles?show_on_home=true&limit=10 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:59530 - "[1mGET /api/vehicles?limit=1000&t=1777026035480 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:59538 - "[1mGET /api/vehicles?featured=true&limit=4 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:59552 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
+[32mINFO[0m:     127.0.0.1:59566 - "[1mGET /api/vehicles?limit=1000&t=1777026035495 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:59576 - "[1mGET /api/vehicles?featured=true&limit=4 HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:59588 - "[1mGET /api/auth/me HTTP/1.1[0m" [31m401 Unauthorized[0m
